@@ -40,12 +40,13 @@ AddRiscToSeurat <- function(seuratobj, riscobj, npcs = 50) {
   obj@assays$integrated <- CreateAssayObject(
     data = data
   )
+  rm(data)
   cell.embeddings <- riscobj@DimReduction$cell.pls
   # again get rid of the suffix
   rownames(cell.embeddings) <- gsub(
     'Set[0-9]+_', 
     '', 
-    rownames(cell.pls)
+    rownames(cell.embeddings)
   )
   colnames(cell.pls) <- paste('PC', 1:npcs, sep = '_')
   seuratobj@reductions$pca <- CreateDimReducObject(
