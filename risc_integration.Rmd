@@ -1,0 +1,340 @@
+---
+title: "risc_integration"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(SeuratObject)
+library(SeuratDisk)
+library(dplyr)
+library(ggplot2)
+library(tidyverse)
+library(gridExtra)
+library(grid)
+library(RISC)
+```
+# Loading and converting SeuratObject
+```{r}
+ConvertToRISC <- function(obj) {
+  counts <- obj@assays$RNA@counts
+  cell <- obj@meta.data
+  gene <- data.frame(
+    Symbol = rownames(counts),
+    RNA = 'Gene Expression',
+    row.names = rownames(counts)
+  )
+  dat <- readscdata(
+    count = counts,
+    cell = cell,
+    gene = gene
+  )
+  return(dat)
+}
+obj <- LoadH5Seurat(
+  '../../processed/uc.qcfiltered.h5Seurat'
+)
+sample.list <- SplitObject(
+  obj,
+  'sample_id'
+)
+rm(obj)
+sample.list <- lapply(
+  X = sample.list,
+  FUN = ConvertToRISC
+)
+detach('package:Seurat')
+```
+# Basic QC with RISC
+```{r}
+umisPerGene <- function(obj, top.genes = 100) {
+  umi.per.gene <- Matrix::rowSums(obj@assay$count)
+  top.x <- sort(
+    umi.per.gene / sum(umi.per.gene),
+    decreasing = TRUE
+  )[1:top.genes]
+  df <- data.frame(
+    rank = 1:top.genes,
+    top.x.genes = top.x
+  )
+  p <- ggplot(df, aes(rank, top.x.genes)) + 
+    geom_bar(stat = 'identity') + 
+    labs(x = 'gene rank', y = '% UMIs per gene')
+}
+lapply(
+  X = sample.list,
+  FUN = FilterPlot
+)
+lapply(
+  X = sample.list,
+  FUN = umisPerGene
+)
+```
+```{r}
+processData <- function(obj, max.percent.umis = 10) {
+  max.umis <- sum(obj@assay$count) * max.percent.umis / 100
+  obj <- scFilter(
+    obj, 
+    min.UMI = 100,
+    max.UMI = max.umis,
+    min.gene = 200,
+    min.cell = 1
+  )
+  obj <- scNormalize(obj)
+  obj <- scDisperse(obj)
+  return(obj)
+}
+sample.list <- lapply(
+  X = sample.list,
+  FUN = processData
+)
+lapply(
+  X = sample.list,
+  FUN = FilterPlot
+)
+```
+```{r}
+DispersionPlot <- function(obj) {
+  df <- as.data.frame(obj@metadata$dispersion)
+  p <- ggplot(df, aes(Mean, SD)) + 
+    geom_point(size = 1) + 
+    geom_smooth(method = 'loess', span = 0.85, formula = 'y ~ x') + 
+    labs(x = 'Mean expression', y = 'Standard Deviation')
+}
+lapply(
+  X = sample.list,
+  FUN = DispersionPlot
+)
+```
+#Finding the right reference set for integration
+Excerpt from [the original publication](https://doi.org/10.1038/s41587-021-00859-x):
+To select the optimal reference dataset, we propose to use three tests to rank individual datasets (Supplementary Fig. 19): 1) cluster score: estimate how many cell clusters are in individual datasets, with the idea that the dataset with more clusters is a better reference; 2) PC′ stv (standard variance) score: estimate how many principal components (PC′ = UΔ, U for gene eigenvectors and Δ for the singular values) can explain the major gene expression variance in each dataset, with the idea that a good reference should have higher PC′ stv score; 3) PC′ dis. (distribution) score: use the Kolmogorov–Smirnov test to detect the gene eigenvector distribution across individual datasets, with the idea that a good reference should not exhibit biased gene eigenvector distribution. From these scores, one can choose a reference by ranking the datasets using a weighted scheme of cluster score > PC stv score > PC dis. score. However, a dataset should not be used as the reference if its PC dis. score is too high, because it indicates a potential outlier sample. This method is implemented in the ‘InPlot’ function of the RISC package. In addition to these general guidelines we also suggest to look at the number of cells in each dataset to avoid picking reference datasets with low number of cells.
+```{r, fig.height = 20, fig.width = 10}
+GetSymbols <- function(obj) {
+  symbols <- obj@rowdata$Symbol
+  return(symbols)
+}
+var.genes <- Reduce(
+  intersect,
+  lapply(
+    X = sample.list,
+    FUN = GetSymbols
+  )
+)
+InPlot(
+  sample.list,
+  var.gene = var.genes,
+  Std.cut = 0.99,
+  ncore = 1,
+  minPC = 25,
+  nPC = 50
+)
+```
+#Integration
+Reordering the samples in the list such that the chosen reference dataset (Set 12) resides at the first index
+```{r}
+ref.name <- names(sample.list[12])
+names.mask <- names(sample.list) %in% c(ref.name)
+sample.names <- c(ref.name, names(sample.list)[!names.mask])
+sample.list <- sample.list[sample.names]
+```
+```{r}
+sample.integrated <- scMultiIntegrate(
+  objects = sample.list,
+  eigens = 20,
+  add.Id = NULL,
+  var.gene = var.genes,
+  method = 'RPCI',
+  align = 'OLS',
+  npc = 50,
+  adjust = TRUE,
+)
+```
+```{r}
+sample.integrated <- scUMAP(
+  sample.integrated,
+  npc = 20,
+  use = 'PLS'
+)
+```
+```{r, fig.height = 10, fig.width = 11}
+DimPlot(
+  sample.integrated,
+  slot = 'cell.umap',
+  colFactor = 'sample_id'
+) + ylim(-10, 10)
+```
+
+```{r, fig.height = 10, fig.width = 11}
+DimPlot(
+  sample.integrated,
+  slot = 'cell.umap',
+  colFactor = 'Status'
+) + ylim(-10, 10)
+```
+```{r, fig.width = 11, fig.height = 10}
+UMAPlot(
+  sample.integrated,
+  genes = 'FOXP3'
+) + ylim(-10, 10)
+```
+```{r, fig.width = 11, fig.height = 10}
+UMAPlot(
+  sample.integrated,
+  genes = 'RORC'
+) + ylim(-10, 10)
+```
+```{r, fig.width = 11, fig.height = 10}
+UMAPlot(
+  sample.integrated,
+  genes = 'IL7R'
+) + ylim(-10, 10)
+```
+#Convert RISC object to Seurat object
+The rationale of the interconversion of RISC and Seurat objects is to generate objects that behave like they were generated by the respective method environment. Thus, we need to put each type of data in the right slots. Taken from the Seurat manual:
+Returns a Seurat object with a new integrated Assay. If normalization.method = "LogNormalize", the integrated data is returned to the data slot and can be treated as log-normalized, corrected data. If normalization.method = "SCT", the integrated data is returned to the scale.data slot and can be treated as centered, corrected Pearson residuals.
+```{r}
+#sample.integrated <- readRDS('../processed/uc.risc.integrated.rds')
+obj <- LoadH5Seurat(
+  '../../processed/uc.qcfiltered.h5Seurat'
+)
+data <- sample.integrated@assay$logcount
+colnames(data) <- gsub(
+  'Set[0-9]+_', 
+  '', 
+  colnames(data)
+)
+data <- data[,colnames(obj@assays$RNA@counts)]
+obj@assays$integrated <- CreateAssayObject(
+  data = data
+)
+rm(data)
+obj@active.assay <- "integrated"
+# Since some of the information the Seurat Object stores is not stored in the RISC object
+# we might consider recomputing the PCA as they did in their scMultiIntegrate function 
+# see https://github.com/bioinfoDZ/RISC/blob/master/R/Integrating.R line 186 - 191 for reference
+# this basically also is what Seurat does
+# scale.beta <- sample.integrated@metadata$Beta
+# colnames(scale.beta) <- gsub(
+#   'Set[0-9]+_', 
+#   '', 
+#   colnames(scale.beta)
+# )
+# beta.pca = irlba::irlba(scale.beta, nv = 50)
+# cell.embeddings <- beta.pca$v
+# colnames(cell.embeddings) <- paste('PC', 1:50, sep = '_')
+# sdev <- beta.pca$d/sqrt(max(1, ncol(scale.beta) - 1))
+# feature.loadings <- beta.pca$u %*% diag(beta.pca$d)
+# actually not doable because scale.beta actually contains a cell_ref x all_cell matrix
+# holding projections of all cells to the reference set
+cell.pls <- sample.integrated@DimReduction$cell.pls
+rownames(cell.pls) <- gsub(
+  'Set[0-9]+_', 
+  '', 
+  rownames(cell.pls)
+)
+colnames(cell.pls) <- paste('PC', 1:50, sep = '_')
+obj@reductions$pca <- CreateDimReducObject(
+  embeddings = cell.pls[colnames(obj@assays$RNA@counts),],
+  assay = 'integrated',
+  key = 'PC_',
+#   misc = list(sum(matrixStats::rowVars(t(scale.beta))))
+)
+rm(cell.pls)
+detach('package:RISC')
+```
+```{r, fig.heigh = 10, fig.width = 11}
+obj <- RunUMAP(
+  obj,
+  reduction = 'pca',
+  dims = 1:30,
+  n.neighbors = 30
+)
+DimPlot(obj, group.by = 'Status')
+DimPlot(obj, group.by = 'sample_id')
+```
+```{r, fig.height = 10, fig.width = 10}
+FeaturePlot(
+  obj, 
+  features = c('FOXP3', 'RORC', 'IL7R', 'BATF'),
+  reduction = 'umap',
+)
+```
+```{r}
+# might fail due to updated Matrix package see also https://github.com/satijalab/seurat/issues/4436
+# restarting session and updating the Matrix package might help
+obj <- FindNeighbors(
+  obj,
+  reduction = "pca", 
+  dims = 1:30
+)
+```
+```{r}
+for (res in c(0.05, 0.06, 0.07, 0.08, 0.09, 0.1)) {
+  tmp <- FindClusters(
+    obj, 
+    resolution = res
+  )
+  p <- DimPlot(
+    tmp, 
+    reduction = "umap", 
+    label = TRUE, 
+    repel = TRUE
+  )
+  plot(
+    p + ggtitle(sprintf("resolution = %f", res))
+  )
+}
+rm(tmp)
+```
+```{r}
+obj <- FindClusters(
+  obj, 
+  resolution = 0.05
+)
+DimPlot(
+  obj, 
+  reduction = "umap", 
+  label = TRUE, 
+  repel = TRUE
+)
+```
+```{r}
+suppressMessages(library(SingleR))
+suppressMessages(library(pheatmap))
+dice.se <- celldex::DatabaseImmuneCellExpressionData()
+pred.dice.cells <- SingleR(   
+  test = as.matrix(obj[['RNA']]@data), 
+  ref = dice.se,
+  labels = dice.se$label.main
+)
+write.table(
+  pred.dice.cells,
+  '../singler/uc_risc_full.tsv',
+  quote = FALSE,
+  row.names = FALSE,
+  sep = '\t'
+)
+```
+```{r, fig.height = 5, fig.width = 10}
+tab.main <- table(
+  Assigned = pred.dice.cells$pruned.labels, 
+  Cluster = obj@meta.data[['seurat_clusters']]
+)
+plot00 <- pheatmap(
+  log2(tab.main + 1), 
+  color = colorRampPalette(c("white", "blue"))(101),
+  silent = TRUE
+)$gtable
+plot01 <- DimPlot(
+  obj,
+  reduction='umap',
+  label=TRUE
+)
+grid.arrange(
+  plot00, 
+  plot01, 
+  layout_matrix = rbind(c(0,1))
+)
+```
