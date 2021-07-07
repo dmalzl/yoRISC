@@ -37,7 +37,7 @@ AddRiscToSeurat <- function(seuratobj, riscobj, npcs = 50) {
   )
   # reorder cells to comply to original order in Seurat object
   data <- data[,colnames(seuratobj@assays$RNA@counts)]
-  obj@assays$integrated <- CreateAssayObject(
+  obj[['integrated']] <- CreateAssayObject(
     data = data
   )
   rm(data)
